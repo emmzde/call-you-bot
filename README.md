@@ -1,13 +1,17 @@
-# «Тебя зовут!» / You've Been Mentioned
+# call-you-bot — «Тебя зовут!»
 
-[![CI](https://github.com/emmzde/tebya-zovut-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/emmzde/tebya-zovut-bot/actions/workflows/ci.yml)
+[![CI](https://github.com/emmzde/call-you-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/emmzde/call-you-bot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## English
 
-I built this Telegram bot for work and release chats where mentions are easy to
-miss. When someone mentions a registered user, the bot sends that person two
-private messages:
+I built the first version of this Telegram bot as a trial project for a fandub
+team. Their work happens across busy production and release chats, so mentions
+are easy to miss. The bot gives every participant a convenient personal inbox
+for those mentions without changing the team's usual workflow.
+
+When someone mentions a registered user, the bot sends that person two private
+messages:
 
 1. `Тебя зовут! Давай быстрее;)`
 2. `Текст сообщения: <message text>` with a button that opens the source
@@ -87,9 +91,14 @@ retries, duplicate protection, and a 300-recipient load scenario.
 
 ## Русский
 
-Я сделал этого Telegram-бота для рабочих чатов и чатов релизов, где легко
-пропустить упоминание. Когда в сообщении отмечают зарегистрированного
-пользователя, бот присылает ему в личные сообщения:
+Первую версию этого Telegram-бота я сделал для фандаб-команды как пробный
+проект. Работа идёт сразу в нескольких загруженных производственных чатах и
+чатах релизов, поэтому упоминания легко пропустить. Бот собирает их в личных
+сообщениях и остаётся удобным для участников, потому что не меняет привычный
+процесс общения.
+
+Когда в сообщении отмечают зарегистрированного пользователя, бот присылает ему
+в личные сообщения:
 
 1. `Тебя зовут! Давай быстрее;)`
 2. `Текст сообщения: <текст>` и кнопку перехода к исходному сообщению.

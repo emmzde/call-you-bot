@@ -19,8 +19,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/emmzde/tebya-zovut-bot"
-Issues = "https://github.com/emmzde/tebya-zovut-bot/issues"
+Repository = "https://github.com/emmzde/call-you-bot"
+Issues = "https://github.com/emmzde/call-you-bot/issues"
 
 [project.scripts]
 tebya-zovut-bot = "tebya_zovut_bot.__main__:main"
