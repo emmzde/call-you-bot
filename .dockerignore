@@ -1,0 +1,14 @@
+.env
+.git/
+.github/
+.gitignore
+.venv/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+tests/
