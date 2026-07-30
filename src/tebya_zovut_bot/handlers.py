@@ -1,18 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Any
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import (
-    TelegramAPIError,
-    TelegramBadRequest,
-    TelegramForbiddenError,
-    TelegramNetworkError,
-    TelegramRetryAfter,
-    TelegramServerError,
-)
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     ChatMemberUpdated,
@@ -23,12 +13,16 @@ from aiogram.types import (
 )
 
 from .message_tools import (
+    NOTIFICATION_TEXT as NOTIFICATION_TEXT,
     UnsupportedMessageLink,
     build_message_link,
+    chat_button_label,
     extract_mentions,
     notification_context,
+    notification_text,
     short_quote,
 )
+from .notifier import NotificationWorker, _send_message_with_retry
 from .storage import Storage
 
 LOGGER = logging.getLogger(__name__)
@@ -36,7 +30,6 @@ GROUP_TYPES = {"group", "supergroup"}
 ACTIVE_MEMBER_STATUSES = {"member", "administrator", "creator"}
 INACTIVE_MEMBER_STATUSES = {"left", "kicked"}
 
-NOTIFICATION_TEXT = "Тебя зовут! Давай быстрее;)"
 GROUP_WELCOME_TEXT = (
     "Бот «Тебя зовут!» подключён.\n\n"
     "Каждому участнику нужно один раз открыть бота по кнопке ниже и нажать "
@@ -60,30 +53,6 @@ CONTENT_TITLES = {
     "video_note": "Видеосообщение",
     "voice": "Голосовое сообщение",
 }
-
-
-class OutboundRateLimiter:
-    """Serialize Bot API sends at a conservative global rate."""
-
-    def __init__(self, rate_per_second: float) -> None:
-        if rate_per_second < 0:
-            raise ValueError("rate_per_second cannot be negative")
-        self._interval = 0.0 if rate_per_second == 0 else 1.0 / rate_per_second
-        self._lock: asyncio.Lock | None = None
-        self._next_slot = 0.0
-
-    async def wait(self) -> None:
-        if self._interval == 0:
-            return
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-
-        async with self._lock:
-            loop = asyncio.get_running_loop()
-            delay = self._next_slot - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._next_slot = max(self._next_slot, loop.time()) + self._interval
 
 
 def _enum_value(value: object) -> str:
@@ -127,82 +96,15 @@ def _private_keyboard(bot_username: str) -> InlineKeyboardMarkup:
     )
 
 
-async def _send_notification(
-    bot: Bot,
-    *,
-    user_id: int,
-    context: str,
-    message_link: str,
-    rate_limiter: OutboundRateLimiter,
-) -> None:
-    await rate_limiter.wait()
-    await _send_message_with_retry(bot, chat_id=user_id, text=NOTIFICATION_TEXT)
-    await rate_limiter.wait()
-    await _send_message_with_retry(
-        bot,
-        chat_id=user_id,
-        text=context,
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="↗ Перейти к сообщению",
-                        url=message_link,
-                    )
-                ]
-            ]
-        ),
-    )
-
-
-async def _send_message_with_retry(
-    bot: Bot,
-    *,
-    attempts: int = 4,
-    **kwargs: Any,
-) -> Message:
-    if attempts < 1:
-        raise ValueError("attempts must be positive")
-
-    for attempt in range(1, attempts + 1):
-        try:
-            return await bot.send_message(**kwargs)
-        except TelegramRetryAfter as error:
-            if attempt == attempts:
-                raise
-            delay = max(float(error.retry_after), 0.0) + 0.1
-            LOGGER.warning(
-                "Telegram flood control; retrying in %.1fs (%s/%s)",
-                delay,
-                attempt,
-                attempts,
-            )
-            await asyncio.sleep(delay)
-        except (TelegramNetworkError, TelegramServerError):
-            if attempt == attempts:
-                raise
-            delay = min(0.5 * (2 ** (attempt - 1)), 4.0)
-            LOGGER.warning(
-                "Temporary Telegram failure; retrying in %.1fs (%s/%s)",
-                delay,
-                attempt,
-                attempts,
-                exc_info=True,
-            )
-            await asyncio.sleep(delay)
-
-    raise RuntimeError("unreachable")
-
-
 def create_router(
     *,
     storage: Storage,
     bot_id: int,
     bot_username: str,
-    send_rate_per_second: float = 25.0,
+    notification_worker: NotificationWorker | None = None,
+    admin_user_ids: frozenset[int] = frozenset(),
 ) -> Router:
     router = Router(name=__name__)
-    rate_limiter = OutboundRateLimiter(send_rate_per_second)
 
     @router.message(CommandStart(), F.chat.type == "private")
     @router.message(Command("help"), F.chat.type == "private")
@@ -212,6 +114,20 @@ def create_router(
             "Готово! Теперь, когда вас упомянут в подключённом рабочем чате, "
             "я пришлю сюда уведомление и кнопку перехода к сообщению.",
             reply_markup=_private_keyboard(bot_username),
+        )
+
+    @router.message(Command("status"), F.chat.type == "private")
+    async def private_status(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else None
+        if user_id not in admin_user_ids:
+            await message.answer("Я на связи.")
+            return
+        stats = storage.queue_stats()
+        await message.answer(
+            "✅ Бот работает\n"
+            f"В очереди: {stats.queued}\n"
+            f"Доставлено за период хранения: {stats.sent}\n"
+            f"Окончательно не доставлено: {stats.permanently_failed}"
         )
 
     @router.message(F.chat.type == "private")
@@ -243,13 +159,14 @@ def create_router(
             and new_status in ACTIVE_MEMBER_STATUSES
         ):
             LOGGER.info(
-                "Bot added to chat id=%s title=%r type=%s status=%s",
+                "Bot added chat_id=%s title=%r type=%s status=%s",
                 event.chat.id,
                 event.chat.title,
                 _enum_value(event.chat.type),
                 new_status,
             )
-            await bot.send_message(
+            await _send_message_with_retry(
+                bot,
                 chat_id=event.chat.id,
                 text=GROUP_WELCOME_TEXT,
                 reply_markup=_registration_keyboard(bot_username),
@@ -267,13 +184,6 @@ def create_router(
         mentions = extract_mentions(source_text, entities)
         if not mentions:
             return
-        LOGGER.info(
-            "Mention detected in chat id=%s title=%r type=%s message=%s",
-            message.chat.id,
-            message.chat.title,
-            _enum_value(message.chat.type),
-            message.message_id,
-        )
 
         try:
             message_link = build_message_link(
@@ -285,12 +195,14 @@ def create_router(
             )
         except UnsupportedMessageLink:
             LOGGER.warning(
-                "Cannot create an exact message link for basic group %s",
+                "Cannot create message link chat_id=%s type=%s",
                 message.chat.id,
+                _enum_value(message.chat.type),
             )
             return
 
         target_ids: set[int] = set()
+        unresolved_count = 0
         for mention in mentions:
             if mention.user is not None:
                 _remember(storage, mention.user, private=False)
@@ -303,73 +215,49 @@ def create_router(
                 if resolved_id is not None:
                     target_ids.add(resolved_id)
                 else:
-                    LOGGER.info(
-                        "Mention @%s is not registered; notification skipped",
-                        mention.username,
-                    )
+                    unresolved_count += 1
 
         target_ids.discard(bot_id)
-        if not target_ids:
+        allowed_target_ids = storage.filter_dm_allowed(target_ids)
+        skipped_count = len(target_ids) - len(allowed_target_ids)
+        if not allowed_target_ids:
+            LOGGER.debug(
+                "Mention skipped chat_id=%s message_id=%s unresolved=%s dm_disabled=%s",
+                message.chat.id,
+                message.message_id,
+                unresolved_count,
+                skipped_count,
+            )
             return
 
         fallback = CONTENT_TITLES.get(
-            _enum_value(message.content_type), "Новое сообщение"
+            _enum_value(message.content_type),
+            "Новое сообщение",
         )
-        quote_text = short_quote(source_text, fallback=fallback)
-        context = notification_context(quote_text)
+        body = notification_text(
+            notification_context(short_quote(source_text, fallback=fallback))
+        )
+        inserted = storage.enqueue_notifications(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            user_ids=allowed_target_ids,
+            body_text=body,
+            button_text=chat_button_label(message.chat.title),
+            message_link=message_link,
+        )
+        if inserted and notification_worker is not None:
+            notification_worker.wake()
 
-        for user_id in target_ids:
-            if not storage.claim_notification(
-                chat_id=message.chat.id,
-                message_id=message.message_id,
-                user_id=user_id,
-            ):
-                continue
-
-            try:
-                await _send_notification(
-                    bot,
-                    user_id=user_id,
-                    context=context,
-                    message_link=message_link,
-                    rate_limiter=rate_limiter,
-                )
-            except (TelegramForbiddenError, TelegramBadRequest) as error:
-                storage.set_dm_allowed(user_id, False)
-                storage.finish_notification(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    user_id=user_id,
-                    sent=False,
-                    error=str(error),
-                )
-                LOGGER.info(
-                    "Cannot notify user %s; they may not have started the bot",
-                    user_id,
-                )
-            except TelegramAPIError as error:
-                storage.finish_notification(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    user_id=user_id,
-                    sent=False,
-                    error=str(error),
-                )
-                LOGGER.exception("Telegram API error while notifying %s", user_id)
-            else:
-                storage.set_dm_allowed(user_id, True)
-                storage.finish_notification(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    user_id=user_id,
-                    sent=True,
-                )
-                LOGGER.info(
-                    "Notification sent to user=%s for chat=%s message=%s",
-                    user_id,
-                    message.chat.id,
-                    message.message_id,
-                )
+        LOGGER.info(
+            "Mention queued chat_id=%s message_id=%s recipients=%s "
+            "duplicates=%s unresolved=%s dm_disabled=%s",
+            message.chat.id,
+            message.message_id,
+            inserted,
+            len(allowed_target_ids) - inserted,
+            unresolved_count,
+            skipped_count,
+        )
 
     router.message.register(process_group_message)
     router.edited_message.register(process_group_message)

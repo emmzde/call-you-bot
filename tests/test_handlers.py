@@ -12,6 +12,7 @@ from tebya_zovut_bot.handlers import (
     _send_message_with_retry,
     create_router,
 )
+from tebya_zovut_bot.notifier import NotificationWorker
 from tebya_zovut_bot.storage import Storage
 
 
@@ -24,7 +25,7 @@ class FakeBot:
         return None
 
 
-def test_group_mention_sends_two_private_messages_once(tmp_path: Path) -> None:
+def test_group_mention_sends_one_durable_notification_once(tmp_path: Path) -> None:
     storage = Storage(tmp_path / "bot.sqlite3")
     try:
         storage.remember_user(
@@ -33,14 +34,19 @@ def test_group_mention_sends_two_private_messages_once(tmp_path: Path) -> None:
             first_name="Анна",
             dm_allowed=True,
         )
+        bot = FakeBot()
+        worker = NotificationWorker(
+            bot=bot,
+            storage=storage,
+            send_rate_per_second=0,
+        )
         router = create_router(
             storage=storage,
             bot_id=999,
             bot_username="tebya_zovut_bot",
-            send_rate_per_second=0,
+            notification_worker=worker,
         )
         group_handler = router.message.handlers[-1].callback
-        bot = FakeBot()
         source = "Релиз готов, зовём @ReleaseLead"
         username = "@ReleaseLead"
         offset = len(source[: source.index(username)].encode("utf-16-le")) // 2
@@ -70,13 +76,17 @@ def test_group_mention_sends_two_private_messages_once(tmp_path: Path) -> None:
 
         asyncio.run(group_handler(message, bot))
         asyncio.run(group_handler(message, bot))
+        asyncio.run(worker.process_next())
 
-        assert len(bot.sent) == 2
-        assert bot.sent[0] == {"chat_id": 200, "text": NOTIFICATION_TEXT}
-        assert bot.sent[1]["text"] == f"Текст сообщения: {source}"
-        button = bot.sent[1]["reply_markup"].inline_keyboard[0][0]
-        assert button.text == "↗ Перейти к сообщению"
+        assert len(bot.sent) == 1
+        assert bot.sent[0]["chat_id"] == 200
+        assert bot.sent[0]["text"] == (
+            f"{NOTIFICATION_TEXT}\n\nТекст сообщения: {source}"
+        )
+        button = bot.sent[0]["reply_markup"].inline_keyboard[0][0]
+        assert button.text == "Релизы"
         assert button.url == "https://t.me/c/987654321/77"
+        assert storage.queue_stats().sent == 1
     finally:
         storage.close()
 

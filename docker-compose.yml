@@ -1,13 +1,35 @@
 services:
   bot:
-    build: .
+    image: ${BOT_IMAGE:-call-you-bot:production}
+    build:
+      context: .
     restart: unless-stopped
+    init: true
     env_file:
       - .env
     environment:
       DATABASE_PATH: /data/bot.sqlite3
+      HEALTHCHECK_PATH: /tmp/tebya-zovut-bot.heartbeat
+      HEALTHCHECK_INTERVAL_SECONDS: "15"
+      LOG_FORMAT: json
     volumes:
       - bot-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,uid=10001,gid=10001,mode=1700
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.50
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
 
 volumes:
   bot-data:
