@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
-from datetime import UTC, datetime
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _bounded_error(error: str | None) -> str | None:
+    if error is None:
+        return None
+    return error.replace("\x00", "")[:1000]
 
 
 def normalize_username(username: str | None) -> str | None:
@@ -16,17 +27,44 @@ def normalize_username(username: str | None) -> str | None:
     return normalized or None
 
 
+@dataclass(frozen=True, slots=True)
+class NotificationJob:
+    chat_id: int
+    message_id: int
+    user_id: int
+    body_text: str
+    button_text: str
+    message_link: str
+    attempt_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class QueueStats:
+    queued: int
+    sent: int
+    permanently_failed: int
+
+
 class Storage:
-    """Small persistent registry of Telegram users and sent notifications."""
+    """Persistent user registry and durable notification outbox."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.path)
+        new_database = not self.path.exists() or self.path.stat().st_size == 0
+        self._connection = sqlite3.connect(self.path, timeout=5.0)
         self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA busy_timeout=5000")
+        if new_database:
+            self._connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self._connection.execute("PRAGMA journal_mode=WAL")
+        self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
+        self._connection.execute("PRAGMA temp_store=MEMORY")
+        self._connection.execute("PRAGMA wal_autocheckpoint=1000")
         self._create_schema()
+        self._migrate_schema()
+        self._enable_incremental_vacuum()
 
     def _create_schema(self) -> None:
         with self._connection:
@@ -51,13 +89,64 @@ class Storage:
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    body_text TEXT,
+                    button_text TEXT,
+                    message_link TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    retryable INTEGER NOT NULL DEFAULT 1
+                        CHECK (retryable IN (0, 1)),
                     PRIMARY KEY (chat_id, message_id, user_id)
                 );
-
-                CREATE INDEX IF NOT EXISTS notifications_user_idx
-                    ON notifications (user_id, created_at);
                 """
             )
+
+    def _migrate_schema(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute(
+                "PRAGMA table_info(notifications)"
+            ).fetchall()
+        }
+        additions = {
+            "body_text": "TEXT",
+            "button_text": "TEXT",
+            "message_link": "TEXT",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "next_attempt_at": "TEXT",
+            "retryable": "INTEGER NOT NULL DEFAULT 1 CHECK (retryable IN (0, 1))",
+        }
+
+        with self._connection:
+            for name, declaration in additions.items():
+                if name not in columns:
+                    self._connection.execute(
+                        f"ALTER TABLE notifications ADD COLUMN {name} {declaration}"
+                    )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS notifications_due_idx
+                ON notifications (
+                    status, retryable, next_attempt_at, created_at
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS notifications_cleanup_idx
+                ON notifications (status, retryable, updated_at)
+                """
+            )
+            self._connection.execute("DROP INDEX IF EXISTS notifications_user_idx")
+
+    def _enable_incremental_vacuum(self) -> None:
+        mode = int(self._connection.execute("PRAGMA auto_vacuum").fetchone()[0])
+        if mode == 2:
+            return
+        LOGGER.info("Migrating SQLite to incremental auto-vacuum")
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        self._connection.execute("VACUUM")
 
     def remember_user(
         self,
@@ -105,7 +194,7 @@ class Storage:
                     user_id,
                     username.removeprefix("@") if username else None,
                     username_key,
-                    first_name or "Пользователь",
+                    (first_name or "Пользователь")[:128],
                     allowed,
                     timestamp,
                 ),
@@ -121,6 +210,24 @@ class Storage:
         ).fetchone()
         return int(row["user_id"]) if row else None
 
+    def filter_dm_allowed(self, user_ids: Iterable[int]) -> set[int]:
+        unique_ids = sorted(set(user_ids))
+        allowed: set[int] = set()
+        # Keep safely below SQLite's traditional 999-variable limit.
+        for offset in range(0, len(unique_ids), 900):
+            chunk = unique_ids[offset : offset + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._connection.execute(
+                f"""
+                SELECT user_id
+                FROM users
+                WHERE dm_allowed = 1 AND user_id IN ({placeholders})
+                """,
+                chunk,
+            ).fetchall()
+            allowed.update(int(row["user_id"]) for row in rows)
+        return allowed
+
     def set_dm_allowed(self, user_id: int, allowed: bool) -> None:
         with self._connection:
             self._connection.execute(
@@ -132,10 +239,238 @@ class Storage:
                 (int(allowed), _now(), user_id),
             )
 
+    def enqueue_notifications(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        user_ids: Iterable[int],
+        body_text: str,
+        button_text: str,
+        message_link: str,
+    ) -> int:
+        timestamp = _now()
+        inserted = 0
+        bounded_body = body_text[:4096]
+        bounded_button = button_text[:128]
+        bounded_link = message_link[:2048]
+
+        with self._connection:
+            for user_id in sorted(set(user_ids)):
+                cursor = self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notifications (
+                        chat_id, message_id, user_id, status, error,
+                        created_at, updated_at, body_text, button_text,
+                        message_link, attempt_count, next_attempt_at, retryable
+                    )
+                    VALUES (
+                        ?, ?, ?, 'pending', NULL, ?, ?, ?, ?, ?, 0, ?, 1
+                    )
+                    """,
+                    (
+                        chat_id,
+                        message_id,
+                        user_id,
+                        timestamp,
+                        timestamp,
+                        bounded_body,
+                        bounded_button,
+                        bounded_link,
+                        timestamp,
+                    ),
+                )
+                inserted += int(cursor.rowcount == 1)
+        return inserted
+
+    def next_due_notification(self) -> NotificationJob | None:
+        row = self._connection.execute(
+            """
+            SELECT
+                chat_id, message_id, user_id, body_text,
+                button_text, message_link, attempt_count
+            FROM notifications
+            WHERE
+                status IN ('pending', 'failed')
+                AND retryable = 1
+                AND body_text IS NOT NULL
+                AND button_text IS NOT NULL
+                AND message_link IS NOT NULL
+                AND COALESCE(next_attempt_at, created_at) <= ?
+            ORDER BY COALESCE(next_attempt_at, created_at), created_at
+            LIMIT 1
+            """,
+            (_now(),),
+        ).fetchone()
+        if row is None:
+            return None
+        return NotificationJob(
+            chat_id=int(row["chat_id"]),
+            message_id=int(row["message_id"]),
+            user_id=int(row["user_id"]),
+            body_text=str(row["body_text"]),
+            button_text=str(row["button_text"]),
+            message_link=str(row["message_link"]),
+            attempt_count=int(row["attempt_count"]),
+        )
+
+    def seconds_until_next_attempt(self) -> float | None:
+        row = self._connection.execute(
+            """
+            SELECT MIN(COALESCE(next_attempt_at, created_at)) AS due_at
+            FROM notifications
+            WHERE
+                status IN ('pending', 'failed')
+                AND retryable = 1
+                AND body_text IS NOT NULL
+                AND button_text IS NOT NULL
+                AND message_link IS NOT NULL
+            """
+        ).fetchone()
+        if row is None or row["due_at"] is None:
+            return None
+        due_at = datetime.fromisoformat(str(row["due_at"]))
+        return max((due_at - datetime.now(UTC)).total_seconds(), 0.0)
+
+    def mark_notification_sent(self, job: NotificationJob) -> None:
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE notifications
+                SET
+                    status = 'sent',
+                    error = NULL,
+                    retryable = 0,
+                    next_attempt_at = NULL,
+                    body_text = NULL,
+                    button_text = NULL,
+                    message_link = NULL,
+                    updated_at = ?
+                WHERE chat_id = ? AND message_id = ? AND user_id = ?
+                """,
+                (_now(), job.chat_id, job.message_id, job.user_id),
+            )
+
+    def mark_notification_failed(
+        self,
+        job: NotificationJob,
+        *,
+        error: str,
+        retryable: bool,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        next_attempt_at: str | None = None
+        if retryable:
+            next_attempt_at = (
+                datetime.now(UTC) + timedelta(seconds=max(retry_after_seconds or 0, 0))
+            ).isoformat(timespec="seconds")
+
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE notifications
+                SET
+                    status = 'failed',
+                    error = ?,
+                    retryable = ?,
+                    attempt_count = attempt_count + 1,
+                    next_attempt_at = ?,
+                    body_text = CASE WHEN ? = 1 THEN body_text ELSE NULL END,
+                    button_text = CASE WHEN ? = 1 THEN button_text ELSE NULL END,
+                    message_link = CASE WHEN ? = 1 THEN message_link ELSE NULL END,
+                    updated_at = ?
+                WHERE chat_id = ? AND message_id = ? AND user_id = ?
+                """,
+                (
+                    _bounded_error(error),
+                    int(retryable),
+                    next_attempt_at,
+                    int(retryable),
+                    int(retryable),
+                    int(retryable),
+                    _now(),
+                    job.chat_id,
+                    job.message_id,
+                    job.user_id,
+                ),
+            )
+
+    def queue_stats(self) -> QueueStats:
+        row = self._connection.execute(
+            """
+            SELECT
+                SUM(
+                    CASE
+                        WHEN status = 'pending'
+                            OR (status = 'failed' AND retryable = 1)
+                        THEN 1 ELSE 0
+                    END
+                ) AS queued,
+                SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent,
+                SUM(
+                    CASE
+                        WHEN status = 'failed' AND retryable = 0
+                        THEN 1 ELSE 0
+                    END
+                ) AS permanently_failed
+            FROM notifications
+            """
+        ).fetchone()
+        return QueueStats(
+            queued=int(row["queued"] or 0),
+            sent=int(row["sent"] or 0),
+            permanently_failed=int(row["permanently_failed"] or 0),
+        )
+
+    def cleanup_notifications(
+        self,
+        *,
+        retention_days: int,
+        batch_size: int = 5000,
+    ) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat(
+            timespec="seconds"
+        )
+        with self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM notifications
+                WHERE rowid IN (
+                    SELECT rowid
+                    FROM notifications
+                    WHERE
+                        updated_at < ?
+                        AND (
+                            status = 'sent'
+                            OR (status = 'failed' AND retryable = 0)
+                            OR body_text IS NULL
+                        )
+                    LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            )
+        return cursor.rowcount
+
+    def maintain(self, *, retention_days: int) -> int:
+        removed = 0
+        for _ in range(20):
+            batch_removed = self.cleanup_notifications(retention_days=retention_days)
+            removed += batch_removed
+            if batch_removed < 5000:
+                break
+        self._connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        self._connection.execute("PRAGMA incremental_vacuum(5000)")
+        self._connection.execute("PRAGMA optimize")
+        return removed
+
+    def healthcheck(self) -> None:
+        self._connection.execute("SELECT 1").fetchone()
+
+    # Compatibility helpers retained for small integrations and older tests.
     def claim_notification(
         self, *, chat_id: int, message_id: int, user_id: int
     ) -> bool:
-        """Return true only for the first attempt for this message and user."""
         timestamp = _now()
         with self._connection:
             cursor = self._connection.execute(
@@ -163,12 +498,12 @@ class Storage:
             self._connection.execute(
                 """
                 UPDATE notifications
-                SET status = ?, error = ?, updated_at = ?
+                SET status = ?, error = ?, retryable = 0, updated_at = ?
                 WHERE chat_id = ? AND message_id = ? AND user_id = ?
                 """,
                 (
                     "sent" if sent else "failed",
-                    error,
+                    _bounded_error(error),
                     _now(),
                     chat_id,
                     message_id,
@@ -177,4 +512,8 @@ class Storage:
             )
 
     def close(self) -> None:
-        self._connection.close()
+        try:
+            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._connection.execute("PRAGMA optimize")
+        finally:
+            self._connection.close()

@@ -10,6 +10,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository
@@ -27,5 +28,25 @@ jobs:
       - name: Lint
         run: ruff check src tests
 
+      - name: Validate deployment scripts
+        run: |
+          bash -n deploy/*.sh
+          shellcheck deploy/*.sh
+
       - name: Test
         run: pytest
+
+      - name: Audit Python dependencies
+        run: >-
+          pip-audit --skip-editable --progress-spinner off
+          --timeout 10 --vulnerability-service osv
+
+      - name: Validate Compose configuration
+        run: |
+          cp .env.example .env
+          BOT_TOKEN=ci-placeholder docker compose config --quiet
+          BOT_TOKEN_SECRET_FILE=.env.example docker compose \
+            -f docker-compose.yml -f docker-compose.secrets.yml config --quiet
+
+      - name: Build production image
+        run: docker build --tag call-you-bot:ci .
