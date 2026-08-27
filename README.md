@@ -46,8 +46,28 @@
 
 ### Установка с GitHub
 
-ZIP передавать не нужно. На сервере достаточно клонировать репозиторий и
-запустить установщик:
+На чистом Ubuntu/Debian/Fedora/RHEL-сервере вставьте одну команду:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/emmzde/call-you-bot/main/deploy/bootstrap.sh | sudo bash
+```
+
+Она сама установит Git и Docker, скачает проект в `/opt/call-you-bot`, попросит
+токен скрытым вводом, запустит бота, настроит self-heal, backups и обновления.
+Повторный запуск этой же команды безопасно обновляет существующую установку.
+
+Чистый сервер физически не установится за одну секунду: скачивание Docker и
+образа зависит от сети. Но действий владельца ровно одно. Для каждого проверенного
+revision CI публикует готовый image; установщик сверяет его label с Git commit и
+обычно пропускает локальную сборку. Если registry недоступен, автоматически
+используется более медленная локальная сборка.
+
+Чтобы новый сервер мог скачать GHCR-образ без GitHub-логина, владелец
+репозитория после первой успешной публикации один раз выставляет package
+`call-you-bot` в режим **Public**. Это влияет только на скорость: пока package
+закрыт, тот же установщик сам выполнит локальную сборку.
+
+Классическая установка остаётся доступна:
 
 ```bash
 git clone https://github.com/emmzde/call-you-bot.git
@@ -55,7 +75,7 @@ cd call-you-bot
 sudo bash deploy/install.sh
 ```
 
-Если на совсем чистом Ubuntu/Debian ещё нет Git:
+Если на совсем чистом Ubuntu/Debian ещё нет Git и вы выбрали ручной вариант:
 
 ```bash
 sudo apt-get update
@@ -73,7 +93,10 @@ sudo dnf install -y git
 
 Поддерживаются Ubuntu, Debian, Fedora, RHEL, Rocky Linux, AlmaLinux и CentOS с
 `systemd`. Короткая инструкция без лишних технических деталей находится в
-[INSTALL_RU.md](INSTALL_RU.md).
+[INSTALL_RU.md](INSTALL_RU.md), а результаты production-аудита — в
+[AUDIT_RU.md](AUDIT_RU.md).
+
+История изменений публикуется в [CHANGELOG.md](CHANGELOG.md).
 
 Установщик:
 
@@ -81,13 +104,20 @@ sudo dnf install -y git
   инструменты;
 - включит автоматический запуск Docker после перезагрузки;
 - скрыто запросит токен от `@BotFather`;
-- скачает и соберёт все зависимости внутри Docker-образа;
+- скачает проверенный готовый Docker-образ для точного Git revision либо
+  безопасно соберёт его локально;
 - запустит контейнер и дождётся состояния `healthy`;
+- включит минутное самовосстановление отсутствующего, остановленного или
+  `unhealthy` контейнера;
+- создаст первый проверенный backup вне Docker volume и включит ежедневные
+  backups;
 - включит ежедневную проверку обновлений.
 
 Во время обновления текущий бот продолжает работать, пока собирается новый
 образ. Перед переключением создаётся резервная копия SQLite. Если новая версия
-не проходит healthcheck, скрипт возвращает предыдущий рабочий образ.
+не проходит локальный healthcheck или не подтверждает связь с Telegram, скрипт
+возвращает предыдущий рабочий образ. При уже недоступном Telegram автоматическое
+обновление откладывается: такой релиз невозможно честно проверить.
 
 ### Три команды для владельца сервера
 
@@ -109,9 +139,13 @@ sudo bash deploy/install.sh --reconfigure-token
 ### Как бот переживает сбои
 
 - Docker поднимает контейнер после перезагрузки сервера или аварийного выхода
-  процесса.
-- Heartbeat проверяет event loop и доступность SQLite. Если процесс зависнет,
-  watchdog завершит его, чтобы Docker мог выполнить чистый перезапуск.
+  процесса. Отдельный systemd reconciler раз в минуту воссоздаёт удалённый
+  контейнер и контролируемо перезапускает `unhealthy`.
+- Локальный healthcheck проверяет event loop и SQLite. Если процесс зависнет,
+  watchdog завершит его для чистого перезапуска.
+- Доступность Telegram API контролируется отдельно. При внешнем сбое бот не
+  попадает в бессмысленный restart-loop, а остаётся запущенным, продолжает
+  переподключение и отправляет сигнал во внешний мониторинг.
 - Временные ошибки Telegram и сети повторяются с exponential backoff и jitter.
 - Незавершённая очередь продолжает отправку после рестарта.
 - Завершённые записи удаляются через 7 дней, WAL регулярно checkpoint-ится.
@@ -122,14 +156,21 @@ sudo bash deploy/install.sh --reconfigure-token
   filesystem и `no-new-privileges`.
 
 Если выключилась вся машина или пропал её диск, бот физически не сможет сам
-сообщить об этом. Для такого случая нужен внешний мониторинг сервера. Все сбои,
-которые видит сам процесс, отражаются в логах и healthcheck.
+сообщить об этом. Укажите независимые heartbeat URL в root-only файле
+`/etc/call-you-bot/ops.env`. Отсутствие минутного heartbeat должно поднимать
+тревогу во внешнем сервисе; отдельный heartbeat контролирует ежедневный backup.
 
-### Диагностика и резервная копия
+### Диагностика, backup и восстановление
 
 ```bash
 # Состояние, healthcheck и последние логи
 sudo bash deploy/status.sh
+
+# Создать проверенный gzip backup вне Docker volume
+sudo bash deploy/backup.sh
+
+# Восстановить backup; перед заменой автоматически сохраняется текущая база
+sudo bash deploy/restore.sh /var/backups/call-you-bot/BACKUP.sqlite3.gz
 
 # Непрерывный поток JSON-логов
 docker compose logs -f --tail=100 bot
@@ -137,17 +178,18 @@ docker compose logs -f --tail=100 bot
 # Проверка целостности базы без остановки бота
 docker compose exec -T bot python -m tebya_zovut_bot.db_admin check
 
-# Согласованная резервная копия работающей SQLite
-docker compose exec -T bot mkdir -p /data/backups
-docker compose exec -T bot python -m tebya_zovut_bot.db_admin \
-  backup /data/backups/bot.sqlite3
-docker cp "$(docker compose ps -q bot):/data/backups/bot.sqlite3" ./bot.sqlite3
 ```
 
 SQLite хранится в Docker volume `bot-data` и переживает пересборку контейнера и
-перезагрузку сервера. Резервную копию всё равно нужно периодически переносить на
-другую машину или в объектное хранилище: локальный volume не спасёт при потере
-диска.
+перезагрузку сервера. Ежедневный timer экспортирует согласованный и проверенный
+backup в `/var/backups/call-you-bot`. Это защищает от удаления volume, но не от
+потери всего VPS. Для off-site хранения настройте в `/etc/call-you-bot/ops.env`
+смонтированный `BACKUP_MIRROR_DIRECTORY` или зашифрованный `RESTIC_REPOSITORY`.
+Restic поддерживает S3, Backblaze B2, SFTP и другие удалённые хранилища.
+
+Production-токен разрешено запускать только на одном сервере. Для разработки и
+ноутбуков используйте отдельного тестового бота: параллельные polling-процессы с
+одним токеном конкурируют за Telegram updates и не разделяют локальную SQLite.
 
 Если указать Telegram ID владельца в `ADMIN_USER_IDS`, команда `/status` в
 личном диалоге покажет состояние очереди и статистику доставок.
@@ -190,6 +232,8 @@ docker compose -f docker-compose.yml -f docker-compose.secrets.yml up -d --build
 | `SEND_RATE_PER_SECOND` | `25` | Общий лимит отправки, максимум 29 |
 | `NOTIFICATION_MAX_ATTEMPTS` | `20` | Максимум попыток доставки |
 | `NOTIFICATION_RETENTION_DAYS` | `7` | Срок хранения завершённых записей |
+| `TELEGRAM_HEALTHCHECK_INTERVAL_SECONDS` | `60` | Период проверки Telegram API |
+| `TELEGRAM_HEALTHCHECK_MAX_AGE_SECONDS` | `300` | Когда считать связь с Telegram потерянной |
 | `ADMIN_USER_IDS` | пусто | Telegram ID владельцев для `/status` |
 
 Полный список с безопасными значениями находится в `.env.example`.
@@ -202,9 +246,20 @@ docker compose -f docker-compose.yml -f docker-compose.secrets.yml up -d --build
 python -m venv .venv
 python -m pip install -e ".[dev]"
 ruff check src tests
+bandit -q -r src
 pytest
 pip-audit
 ```
+
+Полный автономный стресс-профиль не обращается к Telegram и не трогает
+production-базу:
+
+```bash
+python -m tebya_zovut_bot.stress
+```
+
+По умолчанию он проверяет 20 000 пользователей и 100 000 durable-уведомлений:
+дедупликацию, crash/reopen, извлечение очереди, согласованный backup и restore.
 
 На Windows окружение активируется командой
 `.\.venv\Scripts\Activate.ps1`.
@@ -250,8 +305,26 @@ the source chat. The button opens the exact message where the mention happened.
 
 ### Install from GitHub
 
-There is no need to transfer a ZIP archive. Clone the repository on the Linux
-server and run the installer:
+On a clean Ubuntu, Debian, Fedora, or RHEL-family server, paste one command:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/emmzde/call-you-bot/main/deploy/bootstrap.sh | sudo bash
+```
+
+It installs Git and Docker, checks out the project into `/opt/call-you-bot`,
+prompts for the token without echoing it, and configures the bot, self-healing,
+backups, and updates. Re-running the same command safely updates an existing
+installation. Network downloads cannot literally complete in one second, but
+the owner performs one action. A verified prebuilt image is used when available;
+its revision label must match the checked-out Git commit, otherwise the installer
+falls back to a local build.
+
+After the first successful publish, the repository owner should make the
+`call-you-bot` GHCR package **Public** so a new server can pull it anonymously.
+This only affects installation speed: while the package is private, the same
+installer safely builds the image locally.
+
+The classic manual installation remains available:
 
 ```bash
 git clone https://github.com/emmzde/call-you-bot.git
@@ -280,7 +353,9 @@ update timer.
 
 The current bot stays online while an update is downloaded and built. A
 database backup is made before the switch. If the new image does not become
-healthy, the updater rolls back to the previous working image.
+healthy or cannot confirm Telegram connectivity, the updater rolls back to the
+previous working image. Automatic updates are deferred while Telegram is
+already unavailable because a release cannot be validated safely then.
 
 ### Server commands
 
@@ -300,9 +375,14 @@ explains the conflict instead.
 
 ### Failure handling and resource use
 
-- Docker restarts the container after a server reboot or process crash.
-- A heartbeat checks the event loop and SQLite. A watchdog terminates a stuck
-  process so Docker can restart it cleanly.
+- Docker restarts the container after a server reboot or process crash. A
+  systemd reconciler runs every minute to recreate a missing container and
+  rate-limit restarts of an unhealthy one.
+- The local healthcheck covers the event loop and SQLite. A watchdog terminates
+  a stuck process so Docker can restart it cleanly.
+- Telegram API availability is tracked separately. An upstream outage does not
+  create a restart loop: the bot stays alive, keeps reconnecting, and reports
+  the dependency failure to external monitoring.
 - Telegram and network failures use bounded retries with exponential backoff
   and jitter.
 - Pending outbox work resumes after a restart.
@@ -315,15 +395,20 @@ explains the conflict instead.
   filesystem and `no-new-privileges`.
 
 A bot running on a powered-off server cannot report that its own host is down.
-Use an independent host monitor for complete machine or disk failures. Faults
-visible to the process are exposed through structured logs and the container
-healthcheck.
+Configure independent heartbeat URLs in `/etc/call-you-bot/ops.env`; one tracks
+the minute reconciler and another tracks the daily backup.
 
-### Diagnostics and backups
+### Diagnostics, backups, and restore
 
 ```bash
 # State, healthcheck, and recent logs
 sudo bash deploy/status.sh
+
+# Create a verified gzip backup outside the Docker volume
+sudo bash deploy/backup.sh
+
+# Restore a backup with automatic pre-restore backup and rollback
+sudo bash deploy/restore.sh /var/backups/call-you-bot/BACKUP.sqlite3.gz
 
 # Follow structured logs
 docker compose logs -f --tail=100 bot
@@ -331,16 +416,15 @@ docker compose logs -f --tail=100 bot
 # Check the live database
 docker compose exec -T bot python -m tebya_zovut_bot.db_admin check
 
-# Create a consistent live database backup
-docker compose exec -T bot mkdir -p /data/backups
-docker compose exec -T bot python -m tebya_zovut_bot.db_admin \
-  backup /data/backups/bot.sqlite3
-docker cp "$(docker compose ps -q bot):/data/backups/bot.sqlite3" ./bot.sqlite3
 ```
 
 SQLite lives in the `bot-data` Docker volume, so it survives container rebuilds
-and server reboots. Copy backups to another machine or object storage to protect
-against host disk loss.
+and server reboots. A daily timer exports verified backups to
+`/var/backups/call-you-bot`. Configure `BACKUP_MIRROR_DIRECTORY` or an encrypted
+`RESTIC_REPOSITORY` for off-host disaster recovery.
+
+Run the production token on exactly one server. Laptops and development must use
+a separate test bot token; polling processes do not share their SQLite registry.
 
 Set owner Telegram IDs in `ADMIN_USER_IDS` to enable the private `/status`
 command with queue and delivery statistics.
@@ -381,6 +465,8 @@ token is mounted read-only and is not stored in the container environment.
 | `SEND_RATE_PER_SECOND` | `25` | Global send limit, maximum 29 |
 | `NOTIFICATION_MAX_ATTEMPTS` | `20` | Maximum delivery attempts |
 | `NOTIFICATION_RETENTION_DAYS` | `7` | Completed record retention |
+| `TELEGRAM_HEALTHCHECK_INTERVAL_SECONDS` | `60` | Telegram API probe interval |
+| `TELEGRAM_HEALTHCHECK_MAX_AGE_SECONDS` | `300` | Telegram connectivity loss threshold |
 | `ADMIN_USER_IDS` | empty | Telegram owner IDs allowed to use `/status` |
 
 See `.env.example` for the full configuration and safe defaults.
@@ -393,8 +479,15 @@ Python 3.11 or newer is required:
 python -m venv .venv
 python -m pip install -e ".[dev]"
 ruff check src tests
+bandit -q -r src
 pytest
 pip-audit
+```
+
+Run the isolated durable-outbox stress profile with:
+
+```bash
+python -m tebya_zovut_bot.stress
 ```
 
 On Windows, activate the environment with

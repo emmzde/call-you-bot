@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections.abc import Iterable
@@ -125,12 +126,18 @@ class Storage:
                     )
             self._connection.execute(
                 """
-                CREATE INDEX IF NOT EXISTS notifications_due_idx
+                CREATE INDEX IF NOT EXISTS notifications_ready_idx
                 ON notifications (
-                    status, retryable, next_attempt_at, created_at
+                    COALESCE(next_attempt_at, created_at), created_at
                 )
+                WHERE
+                    retryable = 1
+                    AND body_text IS NOT NULL
+                    AND button_text IS NOT NULL
+                    AND message_link IS NOT NULL
                 """
             )
+            self._connection.execute("DROP INDEX IF EXISTS notifications_due_idx")
             self._connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS notifications_cleanup_idx
@@ -189,6 +196,11 @@ class Storage:
                     first_name = excluded.first_name,
                     dm_allowed = excluded.dm_allowed,
                     updated_at = excluded.updated_at
+                WHERE
+                    users.username IS NOT excluded.username
+                    OR users.username_key IS NOT excluded.username_key
+                    OR users.first_name IS NOT excluded.first_name
+                    OR users.dm_allowed IS NOT excluded.dm_allowed
                 """,
                 (
                     user_id,
@@ -213,17 +225,20 @@ class Storage:
     def filter_dm_allowed(self, user_ids: Iterable[int]) -> set[int]:
         unique_ids = sorted(set(user_ids))
         allowed: set[int] = set()
-        # Keep safely below SQLite's traditional 999-variable limit.
-        for offset in range(0, len(unique_ids), 900):
-            chunk = unique_ids[offset : offset + 900]
-            placeholders = ",".join("?" for _ in chunk)
+        # json_each keeps the SQL static and avoids SQLite's host-variable limit.
+        for offset in range(0, len(unique_ids), 5000):
+            chunk = unique_ids[offset : offset + 5000]
             rows = self._connection.execute(
-                f"""
+                """
                 SELECT user_id
                 FROM users
-                WHERE dm_allowed = 1 AND user_id IN ({placeholders})
+                WHERE
+                    dm_allowed = 1
+                    AND user_id IN (
+                        SELECT CAST(value AS INTEGER) FROM json_each(?)
+                    )
                 """,
-                chunk,
+                (json.dumps(chunk, separators=(",", ":")),),
             ).fetchall()
             allowed.update(int(row["user_id"]) for row in rows)
         return allowed
@@ -291,8 +306,7 @@ class Storage:
                 button_text, message_link, attempt_count
             FROM notifications
             WHERE
-                status IN ('pending', 'failed')
-                AND retryable = 1
+                retryable = 1
                 AND body_text IS NOT NULL
                 AND button_text IS NOT NULL
                 AND message_link IS NOT NULL
@@ -320,8 +334,7 @@ class Storage:
             SELECT MIN(COALESCE(next_attempt_at, created_at)) AS due_at
             FROM notifications
             WHERE
-                status IN ('pending', 'failed')
-                AND retryable = 1
+                retryable = 1
                 AND body_text IS NOT NULL
                 AND button_text IS NOT NULL
                 AND message_link IS NOT NULL

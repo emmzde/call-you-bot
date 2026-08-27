@@ -6,6 +6,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-run-*/
+.pytest-tmp/
 .pytest-tmp-*/
 .ruff_cache/
 .coverage

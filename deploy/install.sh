@@ -15,9 +15,19 @@ fi
 
 # shellcheck source=deploy/common.sh
 source "$(dirname -- "${SCRIPT_PATH}")/common.sh"
+# shellcheck source=deploy/reliability.sh
+source "$(dirname -- "${SCRIPT_PATH}")/reliability.sh"
 
 AUTO_UPDATES=1
 RECONFIGURE_TOKEN=0
+OLD_IMAGE_ID=""
+OLD_SOURCE_REVISION=""
+OLD_TELEGRAM_HEALTHY=0
+PRE_SWITCH_BACKUP_CREATED=0
+REPLACEMENT_ATTEMPTED=0
+TOKEN_REPLACED=0
+TOKEN_ROLLBACK_FILE=""
+TOKEN_STAGE_FILE=""
 
 for argument in "$@"; do
     case "${argument}" in
@@ -33,15 +43,64 @@ for argument in "$@"; do
     esac
 done
 
+cleanup_install() {
+    if [[ -n "${TOKEN_ROLLBACK_FILE}" ]]; then
+        rm -f -- "${TOKEN_ROLLBACK_FILE}"
+    fi
+    if [[ -n "${TOKEN_STAGE_FILE}" ]]; then
+        rm -f -- "${TOKEN_STAGE_FILE}"
+    fi
+}
+
+rollback_existing_installation() {
+    local restored_token=0
+
+    if ((TOKEN_REPLACED == 1)) && [[ -s "${TOKEN_ROLLBACK_FILE}" ]]; then
+        install -m 0600 "${TOKEN_ROLLBACK_FILE}" \
+            "${PROJECT_DIR}/secrets/bot_token"
+        TOKEN_REPLACED=0
+        restored_token=1
+        warn "Предыдущий Telegram token восстановлен."
+    fi
+
+    if ((REPLACEMENT_ATTEMPTED == 0)) || [[ -z "${OLD_IMAGE_ID}" ]]; then
+        return 0
+    fi
+
+    warn "Возвращаю предыдущий production-образ…"
+    if [[ -n "${OLD_SOURCE_REVISION}" ]]; then
+        git_safe reset --hard "${OLD_SOURCE_REVISION}"
+        warn "Production-файлы возвращены к revision ${OLD_SOURCE_REVISION}."
+    fi
+    docker tag "${OLD_IMAGE_ID}" "${BOT_IMAGE}"
+    compose up -d --force-recreate --no-build --remove-orphans bot
+    REPLACEMENT_ATTEMPTED=0
+    if wait_for_bot_health 180; then
+        log "Предыдущая рабочая версия восстановлена."
+        return 0
+    fi
+    show_bot_logs
+    if ((restored_token == 1)); then
+        warn "Старый token возвращён, но контейнер не стал healthy."
+    fi
+    return 1
+}
+
 on_error() {
     local exit_code=$?
+    local failed_line="${BASH_LINENO[0]}"
+    trap - ERR
+    if ! rollback_existing_installation; then
+        warn "Автоматический rollback не завершился; требуется администратор."
+    fi
     printf '\n\033[1;31mУстановка остановлена на строке %s.\033[0m\n' \
-        "${BASH_LINENO[0]}" >&2
+        "${failed_line}" >&2
     printf 'Скопируйте этот вывод разработчику. Код ошибки: %s\n' \
         "${exit_code}" >&2
     exit "${exit_code}"
 }
 trap on_error ERR
+trap cleanup_install EXIT
 
 load_os_release() {
     [[ -r /etc/os-release ]] || die "Не удалось определить Linux-дистрибутив."
@@ -55,9 +114,10 @@ install_basic_tools() {
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ca-certificates curl git util-linux
+            ca-certificates coreutils curl findutils git gzip util-linux
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y ca-certificates curl git util-linux
+        dnf install -y \
+            ca-certificates coreutils curl findutils git gzip util-linux
     else
         die "Поддерживаются Ubuntu, Debian, Fedora, RHEL, Rocky, AlmaLinux и CentOS."
     fi
@@ -213,6 +273,8 @@ MAINTENANCE_INTERVAL_SECONDS=3600
 SHUTDOWN_GRACE_SECONDS=20
 HEALTHCHECK_INTERVAL_SECONDS=15
 WATCHDOG_TIMEOUT_SECONDS=120
+TELEGRAM_HEALTHCHECK_INTERVAL_SECONDS=60
+TELEGRAM_HEALTHCHECK_MAX_AGE_SECONDS=300
 ADMIN_USER_IDS=
 EOF
         log "Создан production-файл настроек."
@@ -242,9 +304,17 @@ configure_token() {
         unset token
         die "Токен имеет неверный формат. Запустите установку ещё раз."
     fi
-    printf '%s' "${token}" >"${token_file}"
+    if [[ -s "${token_file}" ]]; then
+        TOKEN_ROLLBACK_FILE="/var/lib/call-you-bot/token-rollback-$$"
+        install -m 0600 "${token_file}" "${TOKEN_ROLLBACK_FILE}"
+    fi
+    TOKEN_STAGE_FILE="${secret_directory}/.bot_token-$$"
+    printf '%s' "${token}" >"${TOKEN_STAGE_FILE}"
+    chmod 600 "${TOKEN_STAGE_FILE}"
+    TOKEN_REPLACED=1
+    mv -f -- "${TOKEN_STAGE_FILE}" "${token_file}"
+    TOKEN_STAGE_FILE=""
     unset token
-    chmod 600 "${token_file}"
     log "Токен сохранён как Docker secret."
 }
 
@@ -252,6 +322,7 @@ install_update_timer() {
     local escaped_project
     escaped_project="${PROJECT_DIR//\\/\\\\}"
     escaped_project="${escaped_project//\"/\\\"}"
+    escaped_project="${escaped_project//%/%%}"
 
     if ((AUTO_UPDATES == 0)); then
         systemctl disable --now call-you-bot-update.timer >/dev/null 2>&1 || true
@@ -275,6 +346,7 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory="${escaped_project}"
 ExecStart=/bin/bash "${escaped_project}/deploy/update.sh" --automatic
+TimeoutStartSec=45min
 EOF
 
     cat >/etc/systemd/system/call-you-bot-update.timer <<'EOF'
@@ -303,27 +375,92 @@ main() {
     ensure_docker
     configure_update_source
     configure_environment
+    configure_operations
+    acquire_operations_lock || die "Другая production-операция уже выполняется."
+
+    local candidate_old_revision=""
+    local old_container
+    local old_status=""
+    old_container="$(bot_container_id)"
+    if [[ -n "${old_container}" ]]; then
+        OLD_IMAGE_ID="$(
+            docker inspect --format '{{.Image}}' "${old_container}" 2>/dev/null || true
+        )"
+        candidate_old_revision="$(
+            docker inspect --format \
+                '{{index .Config.Labels "com.tebya-zovut-bot.revision"}}' \
+                "${old_container}" 2>/dev/null || true
+        )"
+        if [[ "${candidate_old_revision}" =~ ^[0-9a-f]{40,64}$ ]] && \
+            [[ -z "$(git_safe status --porcelain 2>/dev/null || true)" ]] && \
+            git_safe cat-file -e "${candidate_old_revision}^{commit}" 2>/dev/null; then
+            OLD_SOURCE_REVISION="${candidate_old_revision}"
+        fi
+        old_status="$(
+            docker inspect --format '{{.State.Status}}' \
+                "${old_container}" 2>/dev/null || true
+        )"
+        if [[ "${old_status}" == "running" ]]; then
+            if telegram_is_healthy; then
+                OLD_TELEGRAM_HEALTHY=1
+            fi
+            info "Создаю backup перед переключением существующей установки…"
+            /bin/bash "${PROJECT_DIR}/deploy/backup.sh"
+            PRE_SWITCH_BACKUP_CREATED=1
+        fi
+    fi
+
     configure_token
 
     local revision
     revision="$(source_revision)"
-    info "Скачиваю базовый образ и устанавливаю зависимости внутри контейнера…"
-    build_production_image "${revision}"
-    compose up -d --no-build --remove-orphans bot
+    info "Подготавливаю production-образ…"
+    prepare_production_image "${revision}"
+    REPLACEMENT_ATTEMPTED=1
+    if ! compose up -d --no-build --remove-orphans bot; then
+        rollback_existing_installation || true
+        die "Не удалось запустить новый production-контейнер."
+    fi
 
     info "Жду, пока бот пройдёт самопроверку…"
     if ! wait_for_bot_health 180; then
         show_bot_logs
-        die "Бот не прошёл healthcheck. Старые данные сохранены."
+        if rollback_existing_installation; then
+            die "Новая версия не прошла healthcheck; предыдущая восстановлена."
+        fi
+        die "Бот не прошёл healthcheck. Данные сохранены, но требуется администратор."
+    fi
+
+    telegram_ready=1
+    info "Проверяю реальную связь с Telegram API…"
+    if ! wait_for_telegram_health 180; then
+        telegram_ready=0
+        if [[ -n "${OLD_IMAGE_ID}" ]] && \
+            ((OLD_TELEGRAM_HEALTHY == 1 || TOKEN_REPLACED == 1)); then
+            rollback_existing_installation || true
+            die "Новая конфигурация не подтвердила Telegram; оставлена предыдущая версия."
+        fi
+        warn "Telegram API пока недоступен; бот продолжит переподключаться без restart-loop."
+    fi
+    REPLACEMENT_ATTEMPTED=0
+
+    if ((PRE_SWITCH_BACKUP_CREATED == 0)); then
+        info "Создаю первый внешний backup базы…"
+        /bin/bash "${PROJECT_DIR}/deploy/backup.sh"
     fi
 
     install_update_timer
+    install_reliability_timers
     docker image prune -f \
         --filter label=com.tebya-zovut-bot.managed=true >/dev/null || true
 
     printf '\n'
     log "Установка полностью завершена."
-    printf 'Бот работает и будет автоматически запускаться после перезагрузки.\n'
+    if ((telegram_ready == 1)); then
+        printf 'Бот работает и будет автоматически запускаться после перезагрузки.\n'
+    else
+        warn "Сервис установлен, но связь с Telegram ещё не подтверждена."
+    fi
     printf 'Проверить состояние: sudo bash "%s/deploy/status.sh"\n' "${PROJECT_DIR}"
     printf 'Обновить вручную:  sudo bash "%s/deploy/update.sh"\n' "${PROJECT_DIR}"
 }

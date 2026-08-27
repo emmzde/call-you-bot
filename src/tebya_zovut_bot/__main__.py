@@ -16,7 +16,7 @@ from aiogram.utils.backoff import BackoffConfig
 
 from .config import Config
 from .handlers import create_router
-from .health import RuntimeHealth
+from .health import AsyncServiceProbe, RuntimeHealth
 from .logging_config import configure_logging
 from .notifier import NotificationWorker
 from .storage import Storage
@@ -72,8 +72,18 @@ async def run() -> None:
         interval_seconds=config.healthcheck_interval_seconds,
         watchdog_timeout_seconds=config.watchdog_timeout_seconds,
     )
+    telegram_health = AsyncServiceProbe(
+        path=config.telegram_healthcheck_path,
+        interval_seconds=config.telegram_healthcheck_interval_seconds,
+        operation=bot.get_me,
+        name="Telegram API",
+    )
 
     try:
+        # Liveness is independent from Telegram availability. Keeping this
+        # heartbeat alive during an upstream outage prevents restart loops while
+        # the startup call continues its own bounded-backoff retries.
+        health.start()
         bot_user = await _telegram_startup_call("getMe", bot.get_me)
         if not bot_user.username:
             raise RuntimeError("Telegram did not return a username for the bot")
@@ -95,7 +105,7 @@ async def run() -> None:
         )
 
         worker.start()
-        health.start()
+        telegram_health.start(initially_healthy=True)
         LOGGER.info(
             "Bot ready username=@%s bot_id=%s polling_timeout=%ss send_rate=%.1f/s",
             bot_user.username,
@@ -118,6 +128,7 @@ async def run() -> None:
             ),
         )
     finally:
+        await telegram_health.stop()
         await health.stop()
         await worker.stop(grace_seconds=config.shutdown_grace_seconds)
         storage.close()

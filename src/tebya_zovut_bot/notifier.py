@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import random
+import secrets
 from contextlib import suppress
 from typing import Any
 
@@ -26,6 +26,7 @@ TEMPORARY_TELEGRAM_ERRORS = (
     TelegramServerError,
     TelegramRetryAfter,
 )
+JITTER_RANDOM = secrets.SystemRandom()
 
 
 class OutboundRateLimiter:
@@ -183,7 +184,7 @@ class NotificationWorker:
             self._retry_base_seconds * (2 ** max(attempt_number - 1, 0)),
             self._retry_max_seconds,
         )
-        return base * random.uniform(0.85, 1.15)
+        return base * JITTER_RANDOM.uniform(0.85, 1.15)
 
     async def _deliver(self, job: NotificationJob) -> None:
         try:
@@ -203,7 +204,7 @@ class NotificationWorker:
                     ]
                 ),
             )
-        except (TelegramForbiddenError, TelegramBadRequest) as error:
+        except TelegramForbiddenError as error:
             self._storage.set_dm_allowed(job.user_id, False)
             self._storage.mark_notification_failed(
                 job,
@@ -212,6 +213,20 @@ class NotificationWorker:
             )
             LOGGER.warning(
                 "Permanent notification failure user_id=%s chat_id=%s message_id=%s",
+                job.user_id,
+                job.chat_id,
+                job.message_id,
+            )
+        except TelegramBadRequest as error:
+            # A bad request can be caused by this specific payload or button.
+            # It must not globally unregister a user who still allows DMs.
+            self._storage.mark_notification_failed(
+                job,
+                error=str(error),
+                retryable=False,
+            )
+            LOGGER.error(
+                "Invalid notification payload user_id=%s chat_id=%s message_id=%s",
                 job.user_id,
                 job.chat_id,
                 job.message_id,

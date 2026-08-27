@@ -94,6 +94,9 @@ class Config:
     healthcheck_path: Path
     healthcheck_interval_seconds: int
     watchdog_timeout_seconds: int
+    telegram_healthcheck_path: Path
+    telegram_healthcheck_interval_seconds: int
+    telegram_healthcheck_max_age_seconds: int
     admin_user_ids: frozenset[int]
 
     @classmethod
@@ -140,6 +143,24 @@ class Config:
             raise ValueError(
                 "WATCHDOG_TIMEOUT_SECONDS must be at least three times "
                 "HEALTHCHECK_INTERVAL_SECONDS"
+            )
+
+        telegram_health_interval = _as_int(
+            "TELEGRAM_HEALTHCHECK_INTERVAL_SECONDS",
+            default=60,
+            minimum=15,
+            maximum=600,
+        )
+        telegram_health_max_age = _as_int(
+            "TELEGRAM_HEALTHCHECK_MAX_AGE_SECONDS",
+            default=300,
+            minimum=60,
+            maximum=3600,
+        )
+        if telegram_health_max_age < telegram_health_interval * 3:
+            raise ValueError(
+                "TELEGRAM_HEALTHCHECK_MAX_AGE_SECONDS must be at least three "
+                "times TELEGRAM_HEALTHCHECK_INTERVAL_SECONDS"
             )
 
         return cls(
@@ -196,5 +217,13 @@ class Config:
             ).expanduser(),
             healthcheck_interval_seconds=health_interval,
             watchdog_timeout_seconds=watchdog_timeout,
+            telegram_healthcheck_path=Path(
+                os.getenv(
+                    "TELEGRAM_HEALTHCHECK_PATH",
+                    "data/telegram.heartbeat",
+                )
+            ).expanduser(),
+            telegram_healthcheck_interval_seconds=telegram_health_interval,
+            telegram_healthcheck_max_age_seconds=telegram_health_max_age,
             admin_user_ids=_as_user_ids(os.getenv("ADMIN_USER_IDS")),
         )

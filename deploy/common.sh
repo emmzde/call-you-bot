@@ -7,12 +7,34 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_NAME_FILE="${PROJECT_NAME_FILE:-/etc/call-you-bot/project-name}"
+if [[ -z "${COMPOSE_PROJECT_NAME:-}" && -r "${PROJECT_NAME_FILE}" ]]; then
+    COMPOSE_PROJECT_NAME="$(<"${PROJECT_NAME_FILE}")"
+fi
+if [[ -z "${COMPOSE_PROJECT_NAME:-}" ]] && command -v docker >/dev/null 2>&1; then
+    COMPOSE_PROJECT_NAME="$(
+        {
+            docker ps -a \
+                --filter label=com.tebya-zovut-bot.managed=true \
+                --filter label=com.docker.compose.service=bot \
+                --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null || true
+        } |
+            head -n 1
+    )"
+fi
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-call-you-bot}"
+[[ "${COMPOSE_PROJECT_NAME}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || {
+    printf 'Некорректное имя Compose project: %s\n' "${COMPOSE_PROJECT_NAME}" >&2
+    exit 1
+}
 COMPOSE_FILES=(
     -f "${PROJECT_DIR}/docker-compose.yml"
     -f "${PROJECT_DIR}/docker-compose.secrets.yml"
 )
 BOT_IMAGE="${BOT_IMAGE:-call-you-bot:production}"
-export BOT_IMAGE
+PREBUILT_IMAGE_REPOSITORY="${PREBUILT_IMAGE_REPOSITORY:-ghcr.io/emmzde/call-you-bot}"
+OPS_CONFIG_FILE="${OPS_CONFIG_FILE:-/etc/call-you-bot/ops.env}"
+export BOT_IMAGE COMPOSE_PROJECT_NAME PREBUILT_IMAGE_REPOSITORY
 
 log() {
     printf '\033[1;32m[OK]\033[0m %s\n' "$*"
@@ -32,11 +54,48 @@ die() {
 }
 
 compose() {
-    docker compose "${COMPOSE_FILES[@]}" "$@"
+    docker compose --project-name "${COMPOSE_PROJECT_NAME}" \
+        "${COMPOSE_FILES[@]}" "$@"
+}
+
+load_ops_config() {
+    if [[ -r "${OPS_CONFIG_FILE}" ]]; then
+        # The installer creates this file root-owned with mode 0600.
+        # shellcheck disable=SC1090
+        source "${OPS_CONFIG_FILE}"
+    fi
+}
+
+ping_heartbeat() {
+    local url="${1:-}"
+    [[ -n "${url}" ]] || return 0
+    [[ "${url}" == https://* ]] || {
+        warn "Heartbeat URL должен использовать HTTPS."
+        return 1
+    }
+    curl --fail --silent --show-error \
+        --connect-timeout 5 --max-time 15 --retry 2 \
+        --output /dev/null "${url}"
+}
+
+acquire_operations_lock() {
+    if [[ "${OPERATIONS_LOCK_HELD:-0}" == "1" ]]; then
+        return 0
+    fi
+    mkdir -p /run/lock
+    exec {OPERATIONS_LOCK_FD}>/run/lock/call-you-bot-operations.lock
+    if ! flock -n "${OPERATIONS_LOCK_FD}"; then
+        return 1
+    fi
+    export OPERATIONS_LOCK_HELD=1
 }
 
 git_safe() {
-    git -c "safe.directory=${PROJECT_DIR}" -C "${PROJECT_DIR}" "$@"
+    git \
+        -c "safe.directory=${PROJECT_DIR}" \
+        -c http.lowSpeedLimit=1024 \
+        -c http.lowSpeedTime=60 \
+        -C "${PROJECT_DIR}" "$@"
 }
 
 bot_container_id() {
@@ -81,45 +140,22 @@ wait_for_bot_health() {
     return 1
 }
 
-backup_database() {
-    local container_id
-    local timestamp
-    local target
+telegram_is_healthy() {
+    compose exec -T bot python -m tebya_zovut_bot.healthcheck \
+        --telegram-only >/dev/null 2>&1
+}
 
-    container_id="$(bot_container_id)"
-    if [[ -z "${container_id}" ]]; then
-        warn "Контейнер ещё не запущен — backup перед обновлением пропущен."
-        return 0
-    fi
+wait_for_telegram_health() {
+    local timeout_seconds="${1:-180}"
+    local deadline=$((SECONDS + timeout_seconds))
 
-    timestamp="$(date -u +%Y%m%d-%H%M%S)"
-    target="/data/backups/pre-update-${timestamp}.sqlite3"
-    if ! compose exec -T bot python -m tebya_zovut_bot.db_admin \
-        backup "${target}"; then
-        warn "Использую совместимый backup для старой версии бота."
-        compose exec -T bot python - "${target}" <<'PY'
-import os
-import sqlite3
-import sys
-from pathlib import Path
-
-source = Path(os.getenv("DATABASE_PATH", "/data/bot.sqlite3"))
-target = Path(sys.argv[1])
-target.parent.mkdir(parents=True, exist_ok=True)
-source_connection = sqlite3.connect(source)
-target_connection = sqlite3.connect(target)
-try:
-    source_connection.backup(target_connection)
-finally:
-    target_connection.close()
-    source_connection.close()
-PY
-    fi
-    if ! compose exec -T bot python -m tebya_zovut_bot.db_admin \
-        prune-backups /data/backups --days 14; then
-        warn "Старая версия ещё не умеет очищать backup; продолжу обновление."
-    fi
-    log "Создан backup базы: ${target}"
+    while ((SECONDS < deadline)); do
+        if telegram_is_healthy; then
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
 }
 
 source_revision() {
@@ -132,10 +168,45 @@ source_revision() {
 
 build_production_image() {
     local revision="$1"
-    docker build \
+    timeout --signal=TERM --kill-after=30s 40m docker build \
         --pull \
+        --build-arg "VCS_REF=${revision}" \
         --label com.tebya-zovut-bot.managed=true \
         --label "com.tebya-zovut-bot.revision=${revision}" \
         --tag "${BOT_IMAGE}" \
         "${PROJECT_DIR}"
+}
+
+pull_prebuilt_image() {
+    local revision="$1"
+    local candidate
+    local image_revision
+
+    [[ "${revision}" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+    candidate="${PREBUILT_IMAGE_REPOSITORY}:${revision}"
+    info "Пробую готовый проверенный образ ${candidate}…"
+    if ! timeout --signal=TERM --kill-after=15s 5m docker pull "${candidate}"; then
+        warn "Готовый образ недоступен; выполню локальную сборку."
+        return 1
+    fi
+    image_revision="$(
+        docker image inspect --format \
+            '{{index .Config.Labels "com.tebya-zovut-bot.revision"}}' \
+            "${candidate}" 2>/dev/null || true
+    )"
+    if [[ "${image_revision}" != "${revision}" ]]; then
+        warn "Revision готового образа не совпадает с исходным кодом; образ отклонён."
+        return 1
+    fi
+    docker tag "${candidate}" "${BOT_IMAGE}"
+    log "Готовый production-образ проверен; долгая сборка не требуется."
+}
+
+prepare_production_image() {
+    local revision="$1"
+    if pull_prebuilt_image "${revision}"; then
+        return 0
+    fi
+    info "Собираю production-образ локально…"
+    build_production_image "${revision}"
 }

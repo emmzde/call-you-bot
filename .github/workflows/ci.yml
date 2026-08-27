@@ -23,23 +23,50 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+        run: |
+          python -m pip install --upgrade "pip==26.2.1"
+          python -m pip install --requirement requirements.lock
+          python -m pip install -e ".[dev]"
 
       - name: Lint
         run: ruff check src tests
+
+      - name: Static security analysis
+        run: bandit -q -r src
 
       - name: Validate deployment scripts
         run: |
           bash -n deploy/*.sh
           shellcheck deploy/*.sh
 
+      - name: Validate production Dockerfile
+        uses: hadolint/hadolint-action@v3.4.0
+        with:
+          dockerfile: Dockerfile
+
       - name: Test
         run: pytest
+
+      - name: Durable outbox stress profile
+        run: >-
+          python -m tebya_zovut_bot.stress
+          --users 5000 --notifications 25000 --drain 5000
 
       - name: Audit Python dependencies
         run: >-
           pip-audit --skip-editable --progress-spinner off
           --timeout 10 --vulnerability-service osv
+
+      - name: Scan repository for vulnerabilities and secrets
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
 
       - name: Validate Compose configuration
         run: |
@@ -50,3 +77,57 @@ jobs:
 
       - name: Build production image
         run: docker build --tag call-you-bot:ci .
+
+      - name: Scan production image for fixable vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: call-you-bot:ci
+          scanners: vuln
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+  publish:
+    name: Publish verified production image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out verified revision
+        uses: actions/checkout@v7
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and publish immutable revision
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/emmzde/call-you-bot:${{ github.sha }}
+            ghcr.io/emmzde/call-you-bot:latest
+          build-args: VCS_REF=${{ github.sha }}
+          labels: |
+            com.tebya-zovut-bot.managed=true
+            com.tebya-zovut-bot.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/emmzde/call-you-bot
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true

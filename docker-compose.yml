@@ -1,16 +1,23 @@
+name: call-you-bot
+
 services:
   bot:
     image: ${BOT_IMAGE:-call-you-bot:production}
     build:
       context: .
-    restart: unless-stopped
+    restart: always
     init: true
+    labels:
+      com.tebya-zovut-bot.managed: "true"
     env_file:
       - .env
     environment:
       DATABASE_PATH: /data/bot.sqlite3
       HEALTHCHECK_PATH: /tmp/tebya-zovut-bot.heartbeat
       HEALTHCHECK_INTERVAL_SECONDS: "15"
+      TELEGRAM_HEALTHCHECK_PATH: /tmp/tebya-zovut-bot.telegram.heartbeat
+      TELEGRAM_HEALTHCHECK_INTERVAL_SECONDS: "60"
+      TELEGRAM_HEALTHCHECK_MAX_AGE_SECONDS: "300"
       LOG_FORMAT: json
     volumes:
       - bot-data:/data
