@@ -58,7 +58,7 @@ bot_stopped=0
 rollback_ready=0
 
 # Invoked indirectly by the EXIT trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     if docker info >/dev/null 2>&1; then
         compose run --rm --no-deps --entrypoint rm bot \
@@ -70,7 +70,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Invoked indirectly by the ERR trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 on_error() {
     local exit_code=$?
     trap - ERR
