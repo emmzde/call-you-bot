@@ -26,6 +26,7 @@ COPY src ./src
 RUN python -m pip install --no-cache-dir --upgrade "pip==26.2.1" \
     && pip install --no-cache-dir --requirement requirements.lock \
     && pip install --no-cache-dir --no-deps . \
+    && python -m pip uninstall --yes pip setuptools wheel \
     && useradd --no-create-home --uid 10001 --shell /usr/sbin/nologin bot \
     && mkdir -p /data \
     && chown bot:bot /data
